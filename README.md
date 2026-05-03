@@ -1,4 +1,4 @@
-# 🦅 [M4RC-XX] Windhawk Mods Collection
+# 🦅 M4RC-XX Windhawk Mods Collection
 
 [![Windhawk](https://img.shields.io/badge/Windhawk-Mods-blue?logo=windows&style=flat-square)](https://windhawk.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
