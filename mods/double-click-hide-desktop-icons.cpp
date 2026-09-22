@@ -2,8 +2,8 @@
 // @id              double-click-hide-desktop-icons
 // @name            Double Click hide Desktop Icons
 // @description     Hides or shows the desktop icons by double-clicking on an empty space.
-// @version         1.0.3
-// @author          Gemini
+// @version         1.0.4
+// @author          M4RC-XX
 // @include         explorer.exe
 // @compilerOptions -lcomctl32
 // ==/WindhawkMod==
@@ -16,10 +16,31 @@
 HHOOK g_hMouseHook = NULL;
 HWND g_hwndDefView = NULL;
 HWND g_hwndDesktopList = NULL;
+HANDLE g_hInitThread = NULL;
+HANDLE g_hStopEvent = NULL;
+
 const int TOGGLE_ICONS_COMMAND = 0x7402;
 
 ULONGLONG g_lastClickTime = 0;
 POINT g_lastClickPos = {0, 0};
+
+// Dynamische Ermittlung von SHELLDLL_DefView ausgehend vom geklickten Fenster
+HWND GetDefView(HWND clickedHwnd) {
+    WCHAR szClass[256];
+    HWND curr = clickedHwnd;
+    while (curr) {
+        GetClassName(curr, szClass, 256);
+        if (wcscmp(szClass, L"SHELLDLL_DefView") == 0) {
+            return curr;
+        }
+        HWND child = FindWindowEx(curr, NULL, L"SHELLDLL_DefView", NULL);
+        if (child) {
+            return child;
+        }
+        curr = GetParent(curr);
+    }
+    return g_hwndDefView;
+}
 
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONDBLCLK)) {
@@ -47,6 +68,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (isDoubleClick) {
             WCHAR szClass[256];
             GetClassName(mhs->hwnd, szClass, 256);
+            HWND targetDefView = GetDefView(mhs->hwnd);
             
             if (wcscmp(szClass, L"SysListView32") == 0) {
                 POINT pt = mhs->pt;
@@ -54,18 +76,20 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 LVHITTESTINFO info;
                 ZeroMemory(&info, sizeof(info));
                 info.pt = pt;
-                int index = SendMessage(mhs->hwnd, LVM_HITTEST, 0, (LPARAM)&info);
+                int index = (int)SendMessage(mhs->hwnd, LVM_HITTEST, 0, (LPARAM)&info);
                 
-                if (index == -1) {
-                    SendMessage(g_hwndDefView, WM_COMMAND, TOGGLE_ICONS_COMMAND, 0);
+                if (index == -1 && targetDefView) {
+                    SendMessage(targetDefView, WM_COMMAND, TOGGLE_ICONS_COMMAND, 0);
                     g_lastClickTime = 0; 
                 }
             } 
             else if (wcscmp(szClass, L"SHELLDLL_DefView") == 0 || 
                      wcscmp(szClass, L"WorkerW") == 0 || 
                      wcscmp(szClass, L"Progman") == 0) {
-                SendMessage(g_hwndDefView, WM_COMMAND, TOGGLE_ICONS_COMMAND, 0);
-                g_lastClickTime = 0; 
+                if (targetDefView) {
+                    SendMessage(targetDefView, WM_COMMAND, TOGGLE_ICONS_COMMAND, 0);
+                    g_lastClickTime = 0; 
+                }
             }
         }
     }
@@ -75,45 +99,86 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     HWND defView = FindWindowEx(hwnd, NULL, L"SHELLDLL_DefView", NULL);
     if (defView) {
+        g_hwndDefView = defView;
         HWND listView = FindWindowEx(defView, NULL, L"SysListView32", L"FolderView");
-        if (listView) {
-            HWND* ret = (HWND*)lParam;
-            *ret = listView;
-            g_hwndDefView = defView;
-            return FALSE;
-        }
+        HWND* ret = (HWND*)lParam;
+        *ret = listView ? listView : defView;
+        return FALSE;
     }
     return TRUE;
 }
 
 HWND FindDesktopListView() {
-    HWND hwndListView = NULL;
+    HWND hwndTarget = NULL;
     HWND hwndProgman = FindWindow(L"Progman", L"Program Manager");
-    HWND defView = FindWindowEx(hwndProgman, NULL, L"SHELLDLL_DefView", NULL);
-    if (defView) {
-        hwndListView = FindWindowEx(defView, NULL, L"SysListView32", L"FolderView");
-        if (hwndListView) {
+    if (hwndProgman) {
+        HWND defView = FindWindowEx(hwndProgman, NULL, L"SHELLDLL_DefView", NULL);
+        if (defView) {
             g_hwndDefView = defView;
-            return hwndListView;
+            HWND listView = FindWindowEx(defView, NULL, L"SysListView32", L"FolderView");
+            return listView ? listView : defView;
         }
     }
-    EnumWindows(EnumWindowsProc, (LPARAM)&hwndListView);
-    return hwndListView;
+    EnumWindows(EnumWindowsProc, (LPARAM)&hwndTarget);
+    return hwndTarget;
+}
+
+DWORD WINAPI InitHookThread(LPVOID lpParam) {
+    HWND hwndDesktop = NULL;
+
+    // Wartet in Intervallen von 250 ms, bis das Desktop-Fenster existiert
+    while (WaitForSingleObject(g_hStopEvent, 250) == WAIT_TIMEOUT) {
+        hwndDesktop = FindDesktopListView();
+        if (hwndDesktop && g_hwndDefView) {
+            break;
+        }
+    }
+
+    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+        return 0;
+    }
+
+    DWORD threadId = GetWindowThreadProcessId(hwndDesktop, NULL);
+    if (threadId != 0) {
+        g_hwndDesktopList = hwndDesktop;
+        g_hMouseHook = SetWindowsHookEx(WH_MOUSE, MouseProc, NULL, threadId);
+    }
+
+    // Thread aktiv halten: Win32 deregistriert Hooks, sobald der installierende Thread terminiert
+    if (g_hMouseHook) {
+        WaitForSingleObject(g_hStopEvent, INFINITE);
+        UnhookWindowsHookEx(g_hMouseHook);
+        g_hMouseHook = NULL;
+    }
+
+    return 0;
 }
 
 BOOL Wh_ModInit() {
-    g_hwndDesktopList = FindDesktopListView();
-    if (!g_hwndDesktopList || !g_hwndDefView) return FALSE;
+    g_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_hStopEvent) return FALSE;
 
-    DWORD threadId = GetWindowThreadProcessId(g_hwndDesktopList, NULL);
-    if (threadId == 0) return FALSE;
+    g_hInitThread = CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
+    if (!g_hInitThread) {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = NULL;
+        return FALSE;
+    }
 
-    g_hMouseHook = SetWindowsHookEx(WH_MOUSE, MouseProc, NULL, threadId);
-    return (g_hMouseHook != NULL);
+    return TRUE;
 }
 
 void Wh_ModUninit() {
-    if (g_hMouseHook) {
-        UnhookWindowsHookEx(g_hMouseHook);
+    if (g_hStopEvent) {
+        SetEvent(g_hStopEvent);
+    }
+    if (g_hInitThread) {
+        WaitForSingleObject(g_hInitThread, 2000);
+        CloseHandle(g_hInitThread);
+        g_hInitThread = NULL;
+    }
+    if (g_hStopEvent) {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = NULL;
     }
 }
